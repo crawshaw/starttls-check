@@ -105,32 +105,15 @@ func smtpDialWithTimeout(hostname string) (*smtp.Client, error) {
 	return client, client.Hello(getThisHostname())
 }
 
-// Performs a connectivity check.
-func checkConnectivity(h HostnameResult) CheckResult {
-	result := CheckResult{Name: "connectivity"}
-	client, err := smtpDialWithTimeout(h.Hostname)
-	if err != nil {
-		return result.Error("Could not establish connection with hostname %s", h.Hostname)
-	}
-	defer client.Close()
-	return result.Success()
-}
-
 // Simply tries to StartTLS with the server.
-func checkStartTLS(h HostnameResult) CheckResult {
+func checkStartTLS(client *smtp.Client) CheckResult {
 	result := CheckResult{Name: "starttls"}
-	client, err := smtpDialWithTimeout(h.Hostname)
-	if err != nil {
-		return result.Error("Could not establish connection with hostname %s", h.Hostname)
-	}
-	defer client.Close()
 	ok, _ := client.Extension("StartTLS")
 	if !ok {
 		return result.Failure("Server does not advertise support for STARTTLS.")
 	}
 	config := tls.Config{InsecureSkipVerify: true}
-	err = client.StartTLS(&config)
-	if err != nil {
+	if err := client.StartTLS(&config); err != nil {
 		return result.Failure("Could not complete a TLS handshake.")
 	}
 	return result.Success()
@@ -149,12 +132,11 @@ func getNamesFromCert(cert *x509.Certificate) []string {
 // based on the mail domain and the MX hostname.
 //
 // Returns a list containing the domain and hostname.
-func (h HostnameResult) defaultValidNames() []string {
-	hostname := h.Hostname
+func defaultValidMX(domain, hostname string) []string {
 	if strings.HasSuffix(hostname, ".") {
 		hostname = hostname[0 : len(hostname)-1]
 	}
-	return []string{h.Domain, hostname}
+	return []string{domain, hostname}
 }
 
 // Validates that a certificate chain is valid for this system roots.
@@ -172,30 +154,20 @@ func verifyCertChain(state tls.ConnectionState) error {
 
 // Checks that the certificate presented is valid for a particular hostname, unexpired,
 // and chains to a trusted root.
-func checkCert(h HostnameResult) CheckResult {
+func checkCert(client *smtp.Client, domain, hostname string, mxHostnames []string) CheckResult {
 	result := CheckResult{Name: "certificate"}
-	client, err := smtpDialWithTimeout(h.Hostname)
-	if err != nil {
-		return result.Error("Could not establish connection with hostname %s", h.Hostname)
-	}
-	defer client.Close()
-	config := tls.Config{InsecureSkipVerify: true}
-	err = client.StartTLS(&config)
-	if err != nil {
-		return result.Error("Could not start TLS: %v", err)
-	}
 	state, ok := client.TLSConnectionState()
 	if !ok {
 		return result.Error("TLS not initiated properly.")
 	}
 	cert := state.PeerCertificates[0]
-	if h.MxHostnames == nil || len(h.MxHostnames) == 0 {
-		h.MxHostnames = h.defaultValidNames()
+	if len(mxHostnames) == 0 {
+		mxHostnames = defaultValidMX(domain, hostname)
 	}
-	if !hasValidName(getNamesFromCert(cert), h.MxHostnames) {
+	if !hasValidName(getNamesFromCert(cert), mxHostnames) {
 		result = result.Failure("Name in cert doesn't match any MX hostnames.")
 	}
-	err = verifyCertChain(state)
+	err := verifyCertChain(state)
 	if err != nil {
 		return result.Failure("Certificate root is not trusted: %v", err)
 	}
@@ -210,15 +182,15 @@ func tlsConfigForCipher(ciphers []uint16) tls.Config {
 }
 
 // Checks to see that insecure ciphers are disabled.
-func checkTLSCipher(h HostnameResult) CheckResult {
+func checkTLSCipher(hostname string) CheckResult {
 	result := CheckResult{Name: "cipher"}
 	badCiphers := []uint16{
 		tls.TLS_RSA_WITH_RC4_128_SHA,
 		tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
 		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA}
-	client, err := smtpDialWithTimeout(h.Hostname)
+	client, err := smtpDialWithTimeout(hostname)
 	if err != nil {
-		return result.Error("Could not establish connection with hostname %s", h.Hostname)
+		return result.Error("Could not establish connection with hostname %s", hostname)
 	}
 	defer client.Close()
 	config := tlsConfigForCipher(badCiphers)
@@ -278,9 +250,27 @@ func checkTLSVersion(h HostnameResult) CheckResult {
 	return result.Success()
 }
 
+func checkOldSSL(hostname string) CheckResult {
+	result := CheckResult{Name: "version"}
+	client, err := smtpDialWithTimeout(hostname)
+	if err != nil {
+		return result.Error("Could not establish connection: %v", err)
+	}
+	defer client.Close()
+	config := tlsConfigForVersion(tls.VersionSSL30)
+	err = client.StartTLS(&config)
+	if err == nil {
+		return result.Failure("Server should NOT support SSLv2/3, but does.")
+	}
+	return result.Success()
+}
+
 // Wrapping helper function to set the status of this hostname.
-func (h *HostnameResult) updateStatus(status CheckStatus) {
-	h.Status = SetStatus(h.Status, status)
+func (h *HostnameResult) addCheck(checkResult CheckResult) {
+	h.Checks[checkResult.Name] = checkResult
+	if checkResult.Status != Success {
+		h.Status = SetStatus(h.Status, checkResult.Status)
+	}
 }
 
 // CheckHostname performs a series of checks against a hostname for an email domain.
@@ -296,30 +286,26 @@ func CheckHostname(domain string, hostname string, mxHostnames []string) Hostnam
 		MxHostnames: mxHostnames,
 		Checks:      make(map[string]CheckResult),
 	}
-	// 0. Perform connectivity sanity check.
-	checkResult := checkConnectivity(result)
-	result.Checks[checkResult.Name] = checkResult
-	if checkResult.Status != Success {
-		result.updateStatus(checkResult.Status)
+
+	// Connect to the SMTP server.
+	connectivityResult := CheckResult{Name: "connectivity"}
+	client, err := smtpDialWithTimeout(hostname)
+	if err != nil {
+		result.addCheck(connectivityResult.Error("Could not establish connection: %v", err))
 		return result
 	}
+	defer client.Close()
+	result.addCheck(connectivityResult.Success())
+
 	// 1. Perform initial StartTLS check (and connectivity).
 	//    If this fails, no other tests need to be performed.
-	checkResult = checkStartTLS(result)
-	result.Checks[checkResult.Name] = checkResult
-	if checkResult.Status != Success {
-		result.updateStatus(checkResult.Status)
+	result.addCheck(checkStartTLS(client))
+	if result.Status != Success {
 		return result
 	}
-	// 2. Perform remainder of checks in parallel.
-	results := make(chan CheckResult)
-	go func() { results <- checkCert(result) }()
-	// go func() { results <- checkTLSCipher(result) }()
-	go func() { results <- checkTLSVersion(result) }()
-	for i := 0; i < 2; i++ {
-		checkResult := <-results
-		result.updateStatus(checkResult.Status)
-		result.Checks[checkResult.Name] = checkResult
-	}
+	result.addCheck(checkCert(client, domain, hostname, mxHostnames))
+	// result.addCheck(checkTLSCipher(hostname))
+	result.addCheck(checkOldSSL(hostname))
+
 	return result
 }
