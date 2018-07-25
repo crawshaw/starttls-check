@@ -287,7 +287,7 @@ func CheckHostname(domain string, hostname string, mxHostnames []string) Hostnam
 		Checks:      make(map[string]CheckResult),
 	}
 
-	// Connect to the SMTP server.
+	// Connect to the SMTP server and use that connection to perform as many checks as possible.
 	connectivityResult := CheckResult{Name: "connectivity"}
 	client, err := smtpDialWithTimeout(hostname)
 	if err != nil {
@@ -297,14 +297,14 @@ func CheckHostname(domain string, hostname string, mxHostnames []string) Hostnam
 	defer client.Close()
 	result.addCheck(connectivityResult.Success())
 
-	// 1. Perform initial StartTLS check (and connectivity).
-	//    If this fails, no other tests need to be performed.
 	result.addCheck(checkStartTLS(client))
 	if result.Status != Success {
 		return result
 	}
 	result.addCheck(checkCert(client, domain, hostname, mxHostnames))
 	// result.addCheck(checkTLSCipher(hostname))
+
+	// Create a new connection to check for SSLv2/3 support because we can't call starttls twice.
 	result.addCheck(checkOldSSL(hostname))
 
 	return result
