@@ -3,7 +3,6 @@ package checker
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net"
 	"net/smtp"
 	"os"
@@ -94,7 +93,10 @@ func getThisHostname() string {
 // Performs an SMTP dial with a short timeout.
 // https://github.com/golang/go/issues/16436
 func smtpDialWithTimeout(hostname string) (*smtp.Client, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:25", hostname), time.Second)
+	if _, _, err := net.SplitHostPort(hostname); err != nil {
+		hostname += ":25"
+	}
+	conn, err := net.DialTimeout("tcp", hostname, time.Second)
 	if err != nil {
 		return nil, err
 	}
