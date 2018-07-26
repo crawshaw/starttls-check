@@ -2,6 +2,7 @@ package checker
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"strings"
 	"testing"
@@ -46,7 +47,7 @@ func TestSelfSigned(t *testing.T) {
 	}
 	defer ln.Close()
 
-	cert, err := tls.X509KeyPair([]byte(cert), []byte(key))
+	cert, err := tls.X509KeyPair([]byte(certString), []byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,11 +66,48 @@ func TestSelfSigned(t *testing.T) {
 	t.Error(result)
 }
 
+func TestSuccessWithFakeCA(t *testing.T) {
+	srv := &smtpd.Server{
+		Handler:  noopHandler,
+		Hostname: "example.com",
+	}
+
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cert, err := tls.X509KeyPair([]byte(certString), []byte(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil {
+			if strings.Contains(err.Error(), "closed") {
+				return
+			}
+			t.Fatal(err)
+		}
+	}()
+
+	certRoots, _ = x509.SystemCertPool()
+	certRoots.AppendCertsFromPEM([]byte(certString))
+	defer func() {
+		certRoots = nil
+	}()
+
+	result := CheckHostname("", ln.Addr().String(), nil)
+	t.Error(result)
+}
+
 // Commands to generate the self-signed certificate below:
 //	openssl req -new -key server.key -out server.csr
 //	openssl x509 -req -in server.csr -signkey server.key -out server.crt
 
-const cert = `-----BEGIN CERTIFICATE-----
+const certString = `-----BEGIN CERTIFICATE-----
 MIIBkDCB+gIJAP/G75+MvzSQMA0GCSqGSIb3DQEBBQUAMA0xCzAJBgNVBAYTAlVT
 MB4XDTE4MDcyNjE2NDM0MloXDTE4MDgyNTE2NDM0MlowDTELMAkGA1UEBhMCVVMw
 gZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBALsGFO2tmSAPtDR8YccGXhNGsQU7

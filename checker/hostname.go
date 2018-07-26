@@ -148,11 +148,18 @@ func verifyCertChain(state tls.ConnectionState) error {
 		pool.AddCert(peerCert)
 	}
 	_, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
-		Roots:         nil, // This ensures that the system roots are used.
+		Roots:         certRoots,
 		Intermediates: pool,
 	})
 	return err
 }
+
+// certRoots is the certificate roots to use for verifying
+// a TLS certificate. It is nil by default so that the system
+// root certs are used.
+//
+// It is a global variable because it is used as a test hook.
+var certRoots *x509.CertPool
 
 // Checks that the certificate presented is valid for a particular hostname, unexpired,
 // and chains to a trusted root.
